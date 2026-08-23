@@ -1,54 +1,67 @@
 #!/usr/bin/env bash
-# Install the Omarchy Sonos bar plugin and the PipeWire AirPlay pieces it needs.
+# Install session extras this plugin needs (PipeWire RAOP + optional CLI).
+# Does not move or symlink the plugin folder: `omarchy plugin add` owns that,
+# and Omarchy rejects plugin directories that contain symlinks.
 set -euo pipefail
 
 root=$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)
 plugin_id="tbye.sonos"
 config_home="${XDG_CONFIG_HOME:-$HOME/.config}"
-plugin_dst="$config_home/omarchy/plugins/$plugin_id"
+state_home="${XDG_STATE_HOME:-$HOME/.local/state}"
 
 have() { command -v "$1" >/dev/null 2>&1; }
+
+usage() {
+  cat <<EOF
+Usage: $(basename "$0") [--runtime]
+
+Install PipeWire AirPlay discovery and the omarchy-sonos CLI. This script
+never relocates ~/.config/omarchy/plugins/${plugin_id}.
+
+  --runtime   Same as the default (accepted for compatibility).
+  -h, --help  Show this help.
+EOF
+}
+
+case "${1:-}" in
+  ""|--runtime) ;;
+  -h|--help) usage; exit 0 ;;
+  *)
+    echo "Unknown option: $1" >&2
+    usage >&2
+    exit 2
+    ;;
+esac
 
 echo "==> PipeWire AirPlay (RAOP) discovery"
 if have omarchy && omarchy pkg missing pipewire-zeroconf >/dev/null 2>&1; then
   omarchy pkg add pipewire-zeroconf
-elif have pacman; then
-  sudo pacman -S --needed --noconfirm pipewire-zeroconf
-else
-  echo "    Install pipewire-zeroconf with your package manager, then re-run."
+elif have pacman && ! pacman -Q pipewire-zeroconf >/dev/null 2>&1; then
+  echo "    Missing pipewire-zeroconf. Install it, then re-run:"
+  echo "      sudo pacman -S --needed pipewire-zeroconf"
 fi
 
 mkdir -p "$config_home/pipewire/pipewire.conf.d"
 cp "$root/contrib/raop-discover.conf" "$config_home/pipewire/pipewire.conf.d/raop-discover.conf"
 echo "    Wrote $config_home/pipewire/pipewire.conf.d/raop-discover.conf"
 
-echo "==> Plugin"
-mkdir -p "$(dirname "$plugin_dst")"
-if [ -e "$plugin_dst" ] && [ ! -L "$plugin_dst" ]; then
-  bak="$plugin_dst.bak.$(date +%s)"
-  echo "    Moving existing plugin to $bak"
-  mv "$plugin_dst" "$bak"
-fi
-ln -sfn "$root" "$plugin_dst"
-echo "    $plugin_dst -> $root"
-
 echo "==> CLI"
 mkdir -p "$HOME/.local/bin"
 ln -sfn "$root/bin/omarchy-sonos" "$HOME/.local/bin/omarchy-sonos"
-echo "    ~/.local/bin/omarchy-sonos"
+echo "    $HOME/.local/bin/omarchy-sonos -> $root/bin/omarchy-sonos"
 
 if have omarchy; then
-  echo "==> Enable in the Omarchy bar"
-  omarchy-shell shell rescanPlugins >/dev/null 2>&1 || true
-  omarchy plugin enable "$plugin_id" --before omarchy.audio >/dev/null 2>&1 \
-    || omarchy plugin enable "$plugin_id" >/dev/null 2>&1 \
-    || true
+  echo "==> Reload audio"
   omarchy restart audio || true
-  omarchy-shell shell rescanPlugins >/dev/null 2>&1 || true
 fi
 
 echo
 echo "Done. Click the wireless-speaker icon in the bar."
+echo "State lives in $state_home/omarchy-sonos/."
 echo "If speakers appear but audio will not route, allow UDP 6001-6010 from your LAN:"
 echo "  sudo ufw allow from 192.168.0.0/16 to any port 6001:6010 proto udp comment 'sonos-raop'"
 echo "AirPlay to Sonos has ~1.5s of latency; that is expected."
+echo
+echo "This script does not install the plugin itself. Use:"
+echo "  omarchy plugin add https://github.com/tbye/tbye.sonos.git --enable"
+echo "Remove extras later with $root/scripts/uninstall.sh"

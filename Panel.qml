@@ -58,11 +58,16 @@ Panel {
   readonly property color hoverFill: bar ? Style.hoverFillFor(bar.foreground, Color.accent) : "transparent"
   readonly property color selectedFill: bar ? Style.selectedFillFor(bar.foreground, Color.accent) : "transparent"
   readonly property bool routingToSonos: outputId !== "" && outputId !== "local"
-  readonly property int rowCount: 1 + speakers.length
   readonly property var selectedSpeaker: speakerByUid(outputId)
+  readonly property var speakerModel: {
+    var list = speakers || []
+    if (typeof list.slice !== "function") return list
+    return list.slice(0, Model.MAX_SPEAKERS)
+  }
+  readonly property int rowCount: 1 + speakerModel.length
   readonly property string currentName: routingToSonos && selectedSpeaker
-    ? selectedSpeaker.name
-    : (localOutput.name || "This computer")
+    ? Model.plainLabel(selectedSpeaker.name, "Speaker")
+    : Model.plainLabel(localOutput.name, "This computer")
   readonly property string heroMeta: loading && speakers.length === 0
     ? "SEARCHING"
     : (lastError && speakers.length === 0 ? "UNREACHABLE" : currentName.toUpperCase())
@@ -212,7 +217,7 @@ Panel {
     var parsed = Model.parseList(raw)
     loading = false
     if (!parsed.ok) {
-      lastError = parsed.error || "Sonos lookup failed"
+      lastError = Model.plainLabel(parsed.error || "Sonos lookup failed", "Sonos lookup failed")
       if (speakers.length === 0)
         statusText = lastError
       return
@@ -222,7 +227,7 @@ Panel {
     raopReady = parsed.raopReady === true
     outputId = parsed.outputId || "local"
     var next = []
-    for (var i = 0; i < parsed.speakers.length; i++) {
+    for (var i = 0; i < parsed.speakers.length && i < Model.MAX_SPEAKERS; i++) {
       var row = parsed.speakers[i]
       var keep = speakerByUid(row.uid)
       if (keep && (row.volumeReady === false || (draggingUid && row.uid === draggingUid))) {
@@ -286,7 +291,7 @@ Panel {
       pendingSelect = ""
     }
     Quickshell.execDetached(["python3", "-B", helper, "set-output", spk.uid])
-    statusText = "Playing on " + spk.name
+    statusText = "Playing on " + Model.plainLabel(spk.name, "Speaker")
     delayedRefresh.restart()
     pendingTimer.restart()
   }
@@ -447,12 +452,37 @@ Panel {
   Process {
     id: listProc
     command: ["python3", "-B", root.helper, "list"]
+    onRunningChanged: {
+      if (running) listWatchdog.restart()
+      else listWatchdog.stop()
+    }
     stdout: StdioCollector {
       waitForEnd: true
-      onStreamFinished: root.applyList(text)
+      onStreamFinished: {
+        if (String(text || "").length > Model.MAX_RAW) {
+          root.loading = false
+          root.lastError = "Sonos helper output was too large"
+          if (root.speakers.length === 0)
+            root.statusText = root.lastError
+          return
+        }
+        root.applyList(text)
+      }
     }
-    stderr: StdioCollector {
-      waitForEnd: true
+  }
+
+  Timer {
+    id: listWatchdog
+    interval: 10000
+    repeat: false
+    onTriggered: {
+      if (!listProc.running) return
+      listProc.running = false
+      root.loading = false
+      if (root.speakers.length === 0) {
+        root.lastError = "Sonos lookup timed out"
+        root.statusText = root.lastError
+      }
     }
   }
 
@@ -505,7 +535,7 @@ Panel {
     bar: root.bar
     text: "󰓃"
     active: root.routingToSonos
-    tooltipText: root.statusText + "\nLeft-click: choose speaker   Right-click: this computer"
+    tooltipText: Model.plainLabel(root.statusText, "Looking for speakers") + "\nLeft-click: choose speaker   Right-click: this computer"
 
     onPressed: function(b) {
       if (b === Qt.RightButton) root.selectLocal()
@@ -633,7 +663,8 @@ Panel {
                     anchors.verticalCenter: parent.verticalCenter
 
                     Text {
-                      text: root.localOutput.name || "This computer"
+                      text: Model.plainLabel(root.localOutput.name, "This computer")
+                      textFormat: Text.PlainText
                       color: root.foreground
                       font.family: root.fontFamily
                       font.pixelSize: Style.font.body
@@ -643,7 +674,8 @@ Panel {
                     }
 
                     Text {
-                      text: root.localOutput.description || "Built-in Audio"
+                      text: Model.plainLabel(root.localOutput.description, "Built-in Audio")
+                      textFormat: Text.PlainText
                       color: root.dim
                       font.family: root.fontFamily
                       font.pixelSize: Style.font.caption
@@ -702,7 +734,8 @@ Panel {
               visible: !root.loading && root.speakers.length === 0
               width: parent.width
               wrapMode: Text.WordWrap
-              text: root.lastError || "No Sonos speakers found on this network"
+              text: Model.plainLabel(root.lastError, "No Sonos speakers found on this network")
+              textFormat: Text.PlainText
               color: root.dim
               font.family: root.fontFamily
               font.pixelSize: Style.font.body
@@ -714,7 +747,7 @@ Panel {
               spacing: Style.space(6)
 
               Repeater {
-                model: root.speakers
+                model: root.speakerModel
 
                 SpeakerRow {
                   required property var modelData
@@ -792,7 +825,8 @@ Panel {
           }
 
           Text {
-            text: row.speaker ? row.speaker.name : ""
+            text: row.speaker ? Model.plainLabel(row.speaker.name, "Speaker") : ""
+            textFormat: Text.PlainText
             color: root.foreground
             font.family: root.fontFamily
             font.pixelSize: Style.font.body

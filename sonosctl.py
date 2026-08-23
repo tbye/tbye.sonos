@@ -3,11 +3,14 @@
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
+import re
+import select
 import subprocess
 import sys
-import urllib.error
+import time
 import urllib.request
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -20,30 +23,205 @@ PLUGIN_DIR = Path(__file__).resolve().parent
 STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state")) / "omarchy-sonos"
 STATE_PATH = STATE_DIR / "state.json"
 SOAP_TIMEOUT = 1.6
-HTTP_TIMEOUT = 1.6
 USER_AGENT = "omarchy-sonos/1.0"
+
+# LAN responders control Avahi and SOAP bodies. Bound every hop before the
+# helper prints JSON or the shell collects it.
+MAX_HTTP_BYTES = 256 * 1024
+MAX_AVAHI_BYTES = 64 * 1024
+MAX_PACTL_BYTES = 256 * 1024
+MAX_STDOUT_BYTES = 128 * 1024
+MAX_SEED_IPS = 16
+MAX_SPEAKERS = 32
+MAX_SINKS = 64
+MAX_NAME_CHARS = 64
+MAX_UID_CHARS = 80
+MAX_SINK_CHARS = 128
+LIST_DEADLINE_S = 8.0
 
 RENDERING_URN = "urn:schemas-upnp-org:service:RenderingControl:1"
 TOPOLOGY_URN = "urn:schemas-upnp-org:service:ZoneGroupTopology:1"
+SOAP_PATHS = {
+    "rendering": "/MediaRenderer/RenderingControl/Control",
+    "topology": "/ZoneGroupTopology/Control",
+}
+
+_LAN_NETS = (
+    ipaddress.IPv4Network("10.0.0.0/8"),
+    ipaddress.IPv4Network("172.16.0.0/12"),
+    ipaddress.IPv4Network("192.168.0.0/16"),
+    ipaddress.IPv4Network("169.254.0.0/16"),
+)
+_CTRL = dict.fromkeys(list(range(32)) + [127])
+_UID_RE = re.compile(r"^RINCON_[0-9A-Fa-f]{12,32}$")
+_MAC_RE = re.compile(r"^[0-9a-f]{12}$")
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_OPENER = urllib.request.build_opener(_NoRedirect)
 
 
 def emit(payload: dict) -> int:
-    json.dump(payload, sys.stdout, ensure_ascii=True)
-    sys.stdout.write("\n")
+    blob = json.dumps(payload, ensure_ascii=True)
+    if len(blob.encode("utf-8")) > MAX_STDOUT_BYTES:
+        blob = json.dumps({"ok": False, "error": "response too large"}, ensure_ascii=True)
+        sys.stdout.write(blob + "\n")
+        return 1
+    sys.stdout.write(blob + "\n")
     return 0 if payload.get("ok", False) else 1
 
 
 def fail(message: str, **extra) -> int:
-    payload = {"ok": False, "error": message}
-    payload.update(extra)
+    payload = {"ok": False, "error": clean_text(message, 200, "error")}
+    for key, value in extra.items():
+        if isinstance(value, str):
+            payload[key] = clean_text(value, MAX_UID_CHARS)
+        else:
+            payload[key] = value
     return emit(payload)
+
+
+def is_lan_ipv4(value: str) -> bool:
+    try:
+        addr = ipaddress.IPv4Address(str(value).strip())
+    except (ipaddress.AddressValueError, ValueError):
+        return False
+    if addr.is_loopback or addr.is_multicast or addr.is_unspecified or addr.is_reserved:
+        return False
+    if str(addr) == "169.254.169.254":
+        return False
+    return any(addr in net for net in _LAN_NETS)
+
+
+def clean_text(value: object, max_chars: int, fallback: str = "") -> str:
+    text = str(value or "").translate(_CTRL).replace("<", "").replace(">", "")
+    text = " ".join(text.split())
+    if len(text) > max_chars:
+        text = text[:max_chars].rstrip()
+    return text or fallback
+
+
+def clean_uid(value: object) -> str:
+    uid = clean_text(value, MAX_UID_CHARS)
+    return uid if _UID_RE.match(uid) else ""
+
+
+def clean_mac(value: object) -> str:
+    mac = clean_text(value, 12).lower()
+    return mac if _MAC_RE.match(mac) else ""
+
+
+def deadline_passed(deadline: float | None) -> bool:
+    return deadline is not None and time.monotonic() >= deadline
+
+
+def read_limited(resp, limit: int) -> bytes:
+    headers = getattr(resp, "headers", None)
+    if headers is not None:
+        raw_len = headers.get("Content-Length")
+        if raw_len is not None:
+            try:
+                declared = int(raw_len)
+            except ValueError:
+                declared = -1
+            if declared > limit:
+                raise ValueError("response too large")
+    buf = bytearray()
+    while len(buf) <= limit:
+        chunk = resp.read(min(65536, limit + 1 - len(buf)))
+        if not chunk:
+            break
+        buf.extend(chunk)
+    if len(buf) > limit:
+        raise ValueError("response too large")
+    return bytes(buf)
+
+
+def run_capped(command: list[str], timeout: float, max_bytes: int) -> bytes:
+    try:
+        proc = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            bufsize=0,
+        )
+    except OSError:
+        return b""
+    assert proc.stdout is not None
+    fd = proc.stdout.fileno()
+    buf = bytearray()
+    end = time.monotonic() + timeout
+    try:
+        while len(buf) <= max_bytes:
+            remaining = end - time.monotonic()
+            if remaining <= 0:
+                break
+            ready, _, _ = select.select([fd], [], [], remaining)
+            if not ready:
+                break
+            chunk = os.read(fd, min(65536, max_bytes + 1 - len(buf)))
+            if not chunk:
+                break
+            buf.extend(chunk)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            try:
+                proc.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                pass
+        try:
+            proc.stdout.close()
+        except OSError:
+            pass
+    return bytes(buf[:max_bytes])
+
+
+def sanitize_state(data: dict) -> dict:
+    seeds: list[str] = []
+    for ip in data.get("seedIps") or []:
+        if isinstance(ip, str) and is_lan_ipv4(ip) and ip not in seeds:
+            seeds.append(ip)
+        if len(seeds) >= MAX_SEED_IPS:
+            break
+    data["seedIps"] = seeds
+    speakers: list[dict] = []
+    for spk in data.get("speakers") or []:
+        if not isinstance(spk, dict):
+            continue
+        ip = str(spk.get("ip") or "")
+        row = {
+            "uid": clean_uid(spk.get("uid")),
+            "ip": ip if is_lan_ipv4(ip) else "",
+            "name": clean_text(spk.get("name"), MAX_NAME_CHARS, "Speaker"),
+            "mac": clean_mac(spk.get("mac")),
+        }
+        if row["uid"] and row["ip"]:
+            speakers.append(row)
+        if len(speakers) >= MAX_SPEAKERS:
+            break
+    data["speakers"] = speakers
+    local_sink = data.get("localSink")
+    if isinstance(local_sink, str):
+        data["localSink"] = clean_text(local_sink, MAX_SINK_CHARS)
+    output = data.get("output")
+    if isinstance(output, str) and output != "local":
+        data["output"] = clean_uid(output) or "local"
+    return data
 
 
 def load_state() -> dict:
     try:
-        data = json.loads(STATE_PATH.read_text(encoding="utf-8"))
+        text = STATE_PATH.read_text(encoding="utf-8")
+        if len(text) > MAX_STDOUT_BYTES:
+            return {}
+        data = json.loads(text)
         if isinstance(data, dict):
-            return data
+            return sanitize_state(data)
     except (OSError, json.JSONDecodeError):
         pass
     return {}
@@ -58,11 +236,15 @@ def save_state(state: dict) -> None:
 
 def http_post(url: str, body: bytes, headers: dict, timeout: float = SOAP_TIMEOUT) -> str:
     req = urllib.request.Request(url, data=body, headers=headers, method="POST")
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return resp.read().decode("utf-8", "replace")
+    with _OPENER.open(req, timeout=timeout) as resp:
+        return read_limited(resp, MAX_HTTP_BYTES).decode("utf-8", "replace")
 
 
 def soap(ip: str, path: str, urn: str, action: str, inner_xml: str = "") -> str:
+    if not is_lan_ipv4(ip):
+        raise ValueError("refusing non-LAN speaker address")
+    if path not in SOAP_PATHS.values():
+        raise ValueError("invalid SOAP path")
     envelope = (
         '<?xml version="1.0"?>'
         '<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" '
@@ -83,6 +265,8 @@ def soap(ip: str, path: str, urn: str, action: str, inner_xml: str = "") -> str:
 
 
 def xml_text(blob: str, local_name: str) -> str | None:
+    if len(blob) > MAX_HTTP_BYTES:
+        return None
     try:
         root = ET.fromstring(blob)
     except ET.ParseError:
@@ -94,7 +278,7 @@ def xml_text(blob: str, local_name: str) -> str | None:
 
 
 def rendering(ip: str, action: str, inner_xml: str) -> str:
-    return soap(ip, "/MediaRenderer/RenderingControl/Control", RENDERING_URN, action, inner_xml)
+    return soap(ip, SOAP_PATHS["rendering"], RENDERING_URN, action, inner_xml)
 
 
 def get_volume(ip: str) -> int:
@@ -150,45 +334,50 @@ def set_mute(ip: str, muted: bool) -> bool:
 def uid_mac(uid: str) -> str:
     raw = uid.replace("RINCON_", "").replace("rincon_", "")
     hex_part = "".join(ch for ch in raw if ch in "0123456789abcdefABCDEF")
-    return hex_part[:12].lower()
+    return clean_mac(hex_part[:12].lower())
 
 
 def host_from_location(location: str) -> str:
     try:
-        return urlparse(location).hostname or ""
+        parsed = urlparse(location)
     except ValueError:
         return ""
+    if parsed.scheme != "http":
+        return ""
+    if parsed.port not in (None, 1400):
+        return ""
+    host = parsed.hostname or ""
+    return host if is_lan_ipv4(host) else ""
 
 
 def avahi_ips() -> list[str]:
-    try:
-        proc = subprocess.run(
-            ["timeout", "2.5", "avahi-browse", "-prt", "_sonos._tcp"],
-            capture_output=True,
-            text=True,
-            timeout=4,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return []
+    raw = run_capped(
+        ["timeout", "2.5", "avahi-browse", "-prt", "_sonos._tcp"],
+        timeout=4,
+        max_bytes=MAX_AVAHI_BYTES,
+    )
     ips: list[str] = []
-    for line in proc.stdout.splitlines():
+    for line in raw.decode("utf-8", "replace").splitlines():
         parts = line.split(";")
         if len(parts) < 8:
             continue
         if parts[0] != "=" or parts[2] != "IPv4":
             continue
         ip = parts[7].strip()
-        if ip and ip not in ips:
+        if is_lan_ipv4(ip) and ip not in ips:
             ips.append(ip)
+        if len(ips) >= MAX_SEED_IPS:
+            break
     return ips
 
 
 def zone_group_state(ip: str) -> ET.Element:
-    raw = soap(ip, "/ZoneGroupTopology/Control", TOPOLOGY_URN, "GetZoneGroupState")
+    raw = soap(ip, SOAP_PATHS["topology"], TOPOLOGY_URN, "GetZoneGroupState")
     inner = xml_text(raw, "ZoneGroupState")
     if not inner:
         raise RuntimeError("empty zone group state")
+    if len(inner) > MAX_HTTP_BYTES:
+        raise RuntimeError("zone group state too large")
     return ET.fromstring(inner)
 
 
@@ -196,15 +385,18 @@ def collect_members(tree: ET.Element) -> list[dict]:
     speakers: list[dict] = []
     seen: set[str] = set()
     for group in tree.findall(".//ZoneGroup"):
-        coordinator = group.get("Coordinator") or ""
+        coordinator = clean_uid(group.get("Coordinator") or "")
         parent_name = ""
         for child in list(group):
             if child.tag.split("}")[-1] == "ZoneGroupMember":
-                parent_name = child.get("ZoneName") or parent_name
+                parent_name = clean_text(child.get("ZoneName"), MAX_NAME_CHARS) or parent_name
                 row = member_row(child, coordinator, parent_name)
                 if row and row["uid"] not in seen:
                     speakers.append(row)
                     seen.add(row["uid"])
+                    if len(speakers) >= MAX_SPEAKERS:
+                        speakers.sort(key=lambda s: (not s["selectable"], s["name"].lower(), s["uid"]))
+                        return speakers
                 for sat in list(child):
                     if sat.tag.split("}")[-1] != "Satellite":
                         continue
@@ -212,18 +404,20 @@ def collect_members(tree: ET.Element) -> list[dict]:
                     if sat_row and sat_row["uid"] not in seen:
                         speakers.append(sat_row)
                         seen.add(sat_row["uid"])
+                        if len(speakers) >= MAX_SPEAKERS:
+                            speakers.sort(key=lambda s: (not s["selectable"], s["name"].lower(), s["uid"]))
+                            return speakers
     speakers.sort(key=lambda s: (not s["selectable"], s["name"].lower(), s["uid"]))
     return speakers
 
 
 def member_row(el: ET.Element, coordinator: str, parent_name: str) -> dict | None:
-    uid = el.get("UUID") or ""
-    name = (el.get("ZoneName") or "").strip() or "Speaker"
+    uid = clean_uid(el.get("UUID") or "")
+    name = clean_text(el.get("ZoneName"), MAX_NAME_CHARS, "Speaker")
     invisible = el.get("Invisible") == "1"
     if invisible and parent_name and name == parent_name:
         return None
-    location = el.get("Location") or ""
-    ip = host_from_location(location)
+    ip = host_from_location(el.get("Location") or "")
     if not uid or not ip:
         return None
     airplay = el.get("AirPlayEnabled") == "1"
@@ -249,8 +443,8 @@ def member_row(el: ET.Element, coordinator: str, parent_name: str) -> dict | Non
     }
 
 
-def fill_levels(speakers: list[dict]) -> None:
-    if not speakers:
+def fill_levels(speakers: list[dict], deadline: float | None = None) -> None:
+    if not speakers or deadline_passed(deadline):
         return
 
     def one(spk: dict) -> tuple[str, int, bool, bool]:
@@ -259,12 +453,18 @@ def fill_levels(speakers: list[dict]) -> None:
         except Exception:
             return spk["uid"], 0, False, False
 
+    submitted: list = []
     with ThreadPoolExecutor(max_workers=min(8, len(speakers))) as pool:
-        futures = [pool.submit(one, spk) for spk in speakers]
-        by_uid = {
-            uid: (vol, muted, ok)
-            for uid, vol, muted, ok in (f.result() for f in as_completed(futures))
-        }
+        for spk in speakers:
+            if deadline_passed(deadline):
+                break
+            submitted.append(pool.submit(one, spk))
+        by_uid = {}
+        for future in as_completed(submitted):
+            if deadline_passed(deadline):
+                break
+            uid, vol, muted, ok = future.result()
+            by_uid[uid] = (vol, muted, ok)
     for spk in speakers:
         vol, muted, ok = by_uid.get(spk["uid"], (0, False, False))
         spk["volumeReady"] = ok
@@ -276,23 +476,31 @@ def fill_levels(speakers: list[dict]) -> None:
 def seed_ips(state: dict) -> list[str]:
     ips: list[str] = []
     for ip in state.get("seedIps") or []:
-        if isinstance(ip, str) and ip and ip not in ips:
+        if isinstance(ip, str) and is_lan_ipv4(ip) and ip not in ips:
             ips.append(ip)
+        if len(ips) >= MAX_SEED_IPS:
+            return ips
     for ip in avahi_ips():
         if ip not in ips:
             ips.append(ip)
+        if len(ips) >= MAX_SEED_IPS:
+            break
     return ips
 
 
-def discover_speakers(state: dict) -> list[dict]:
+def discover_speakers(state: dict, deadline: float | None = None) -> list[dict]:
+    if deadline is None:
+        deadline = time.monotonic() + LIST_DEADLINE_S
     last_error = None
     for ip in seed_ips(state):
+        if deadline_passed(deadline):
+            break
         try:
             tree = zone_group_state(ip)
             speakers = collect_members(tree)
             if speakers:
-                fill_levels(speakers)
-                state["seedIps"] = [s["ip"] for s in speakers]
+                fill_levels(speakers, deadline)
+                state["seedIps"] = [s["ip"] for s in speakers][:MAX_SEED_IPS]
                 state["speakers"] = [
                     {"uid": s["uid"], "ip": s["ip"], "name": s["name"], "mac": s["mac"]}
                     for s in speakers
@@ -302,19 +510,16 @@ def discover_speakers(state: dict) -> list[dict]:
             last_error = exc
             continue
     if last_error:
-        raise RuntimeError(f"could not reach Sonos speakers ({last_error})")
+        raise RuntimeError(f"could not reach Sonos speakers ({clean_text(str(last_error), 160)})")
     return []
 
 
 def run_json(command: list[str], timeout: float = 2.0):
-    try:
-        proc = subprocess.run(command, capture_output=True, text=True, timeout=timeout, check=False)
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    if proc.returncode != 0 or not proc.stdout.strip():
+    raw = run_capped(command, timeout=timeout, max_bytes=MAX_PACTL_BYTES)
+    if not raw.strip():
         return None
     try:
-        return json.loads(proc.stdout)
+        return json.loads(raw.decode("utf-8", "replace"))
     except json.JSONDecodeError:
         return None
 
@@ -325,26 +530,36 @@ def list_sinks() -> list[dict]:
         return []
     sinks = []
     for item in data:
+        if not isinstance(item, dict):
+            continue
         props = item.get("properties") or {}
-        name = str(item.get("name") or "")
-        desc = str(item.get("description") or props.get("device.description") or name)
+        if not isinstance(props, dict):
+            props = {}
+        name = clean_text(item.get("name") or "", MAX_SINK_CHARS)
+        desc = clean_text(
+            item.get("description") or props.get("device.description") or name,
+            MAX_NAME_CHARS,
+            name,
+        )
         blob = " ".join(
             [
                 name,
                 desc,
-                str(props.get("node.nick") or ""),
-                str(props.get("node.name") or ""),
-                str(item.get("driver") or ""),
-                str(props.get("device.description") or ""),
+                clean_text(props.get("node.nick") or "", MAX_SINK_CHARS),
+                clean_text(props.get("node.name") or "", MAX_SINK_CHARS),
+                clean_text(item.get("driver") or "", MAX_SINK_CHARS),
+                clean_text(props.get("device.description") or "", MAX_NAME_CHARS),
             ]
         ).lower()
-        serial = str(props.get("object.serial") or item.get("index") or "")
-        node_id = str(props.get("object.id") or serial)
+        serial = clean_text(props.get("object.serial") or item.get("index") or "", 32)
+        node_id = clean_text(props.get("object.id") or serial, 32)
+        if len(sinks) >= MAX_SINKS:
+            break
         sinks.append(
             {
                 "name": name,
                 "description": desc,
-                "nick": str(props.get("node.nick") or ""),
+                "nick": clean_text(props.get("node.nick") or "", MAX_NAME_CHARS),
                 "serial": serial,
                 "id": node_id,
                 "isRaop": "raop" in blob or "airplay" in blob,
@@ -368,7 +583,7 @@ def default_sink_name() -> str:
         )
     except (OSError, subprocess.TimeoutExpired):
         return ""
-    return proc.stdout.strip()
+    return clean_text(proc.stdout.strip(), MAX_SINK_CHARS)
 
 
 def sink_blob_compact(blob: str) -> str:
