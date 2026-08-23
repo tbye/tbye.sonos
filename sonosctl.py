@@ -241,6 +241,7 @@ def member_row(el: ET.Element, coordinator: str, parent_name: str) -> dict | Non
         "groupCoordinator": coordinator,
         "muted": False,
         "volume": 0,
+        "volumeReady": False,
         "sinkName": "",
         "sinkId": "",
         "sinkReady": False,
@@ -252,19 +253,24 @@ def fill_levels(speakers: list[dict]) -> None:
     if not speakers:
         return
 
-    def one(spk: dict) -> tuple[str, int, bool]:
+    def one(spk: dict) -> tuple[str, int, bool, bool]:
         try:
-            return spk["uid"], get_volume(spk["ip"]), get_mute(spk["ip"])
+            return spk["uid"], get_volume(spk["ip"]), get_mute(spk["ip"]), True
         except Exception:
-            return spk["uid"], 0, False
+            return spk["uid"], 0, False, False
 
     with ThreadPoolExecutor(max_workers=min(8, len(speakers))) as pool:
         futures = [pool.submit(one, spk) for spk in speakers]
-        by_uid = {uid: (vol, muted) for uid, vol, muted in (f.result() for f in as_completed(futures))}
+        by_uid = {
+            uid: (vol, muted, ok)
+            for uid, vol, muted, ok in (f.result() for f in as_completed(futures))
+        }
     for spk in speakers:
-        vol, muted = by_uid.get(spk["uid"], (0, False))
-        spk["volume"] = vol
-        spk["muted"] = muted
+        vol, muted, ok = by_uid.get(spk["uid"], (0, False, False))
+        spk["volumeReady"] = ok
+        if ok:
+            spk["volume"] = vol
+            spk["muted"] = muted
 
 
 def seed_ips(state: dict) -> list[str]:
@@ -424,6 +430,59 @@ def remember_local(state: dict, sinks: list[dict]) -> None:
             state["localSinkId"] = local["id"] or local["serial"]
 
 
+def run_quiet(command: list[str], timeout: float = 2.0) -> None:
+    try:
+        subprocess.run(command, capture_output=True, text=True, timeout=timeout, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+
+def speaker_sink(spk: dict, sinks: list[dict]) -> dict | None:
+    for item in sinks:
+        if sink_matches_speaker(item, spk):
+            return item
+    wanted = spk.get("sinkName") or ""
+    if wanted:
+        for item in sinks:
+            if item.get("name") == wanted:
+                return item
+    return None
+
+
+def set_sink_level(sink: dict, level: int, muted: bool | None = None) -> None:
+    """Keep the PipeWire RAOP sink at the speaker's volume, not 100%.
+
+    AirPlay starts a session by sending the sink volume to the device. New
+    RAOP sinks default to 100%, which would blast the room.
+    """
+    name = sink.get("name") or ""
+    node_id = str(sink.get("id") or sink.get("serial") or "")
+    level = max(0, min(100, int(level)))
+    vol = f"{level}%"
+    if name:
+        run_quiet(["pactl", "set-sink-volume", name, vol])
+        if muted is not None:
+            run_quiet(["pactl", "set-sink-mute", name, "1" if muted else "0"])
+    if node_id:
+        run_quiet(["wpctl", "set-volume", node_id, vol])
+        if muted is not None:
+            run_quiet(["wpctl", "set-mute", node_id, "1" if muted else "0"])
+
+
+def match_sink_to_speaker(sink: dict, spk: dict) -> tuple[int, bool]:
+    ip = spk.get("ip") or ""
+    volume = int(spk.get("volume") or 0)
+    muted = bool(spk.get("muted"))
+    if ip:
+        try:
+            volume = get_volume(ip)
+            muted = get_mute(ip)
+        except Exception:
+            pass
+    set_sink_level(sink, volume, muted)
+    return volume, muted
+
+
 def apply_sink(sink: dict) -> None:
     node_id = sink.get("id") or sink.get("serial") or ""
     name = sink.get("name") or ""
@@ -533,7 +592,12 @@ def cmd_volume(args: list[str]) -> int:
     try:
         spk = resolve_speaker(state, uid)
         volume = set_volume(spk["ip"], level)
-        return emit({"ok": True, "uid": uid, "volume": volume, "muted": get_mute(spk["ip"])})
+        muted = get_mute(spk["ip"])
+        if str(state.get("output") or "") == uid:
+            sink = speaker_sink(spk, list_sinks())
+            if sink:
+                set_sink_level(sink, volume, muted)
+        return emit({"ok": True, "uid": uid, "volume": volume, "muted": muted})
     except KeyError:
         return fail(f"unknown speaker {uid}")
     except Exception as exc:
@@ -556,7 +620,12 @@ def cmd_mute(args: list[str]) -> int:
         else:
             wanted = not current
         muted = set_mute(spk["ip"], wanted)
-        return emit({"ok": True, "uid": uid, "muted": muted, "volume": get_volume(spk["ip"])})
+        volume = get_volume(spk["ip"])
+        if str(state.get("output") or "") == uid:
+            sink = speaker_sink(spk, list_sinks())
+            if sink:
+                set_sink_level(sink, volume, muted)
+        return emit({"ok": True, "uid": uid, "muted": muted, "volume": volume})
     except KeyError:
         return fail(f"unknown speaker {uid}")
     except Exception as exc:
@@ -582,11 +651,7 @@ def cmd_set_output(args: list[str]) -> int:
         speakers = discover_speakers(state)
         attach_sinks(speakers, sinks)
         spk = find_speaker(speakers, target)
-        sink = None
-        for item in sinks:
-            if sink_matches_speaker(item, spk):
-                sink = item
-                break
+        sink = speaker_sink(spk, sinks)
         if not sink:
             state["output"] = spk["uid"]
             save_state(state)
@@ -595,10 +660,19 @@ def cmd_set_output(args: list[str]) -> int:
                 uid=spk["uid"],
                 pending=True,
             )
+        volume, muted = match_sink_to_speaker(sink, spk)
         apply_sink(sink)
         state["output"] = spk["uid"]
         save_state(state)
-        return emit({"ok": True, "outputId": spk["uid"], "sinkName": sink["name"]})
+        return emit(
+            {
+                "ok": True,
+                "outputId": spk["uid"],
+                "sinkName": sink["name"],
+                "volume": volume,
+                "muted": muted,
+            }
+        )
     except KeyError:
         return fail(f"unknown speaker {target}")
     except Exception as exc:

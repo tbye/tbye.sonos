@@ -8,7 +8,11 @@ Click the wireless-speaker icon (just left of the volume control). Pick
 
 System audio is routed over AirPlay (PipeWire RAOP). Volume uses the same
 UPnP calls as the Sonos app, so you can turn any speaker up or down even
-when it is not the current output.
+when it is not the current output. Switching to a room reads that
+speaker's current volume first and applies it to the AirPlay sink, so
+playback does not jump to 100%. While a room is the current output, the
+system volume and that speaker stay in sync — volume keys, the audio
+panel, and the Sonos slider all drive the same level.
 
 ## Requirements
 
@@ -54,6 +58,7 @@ sudo ufw allow from 192.168.0.0/16 to any port 6001:6010 proto udp comment 'sono
 - Drag the slider under a name: set that speaker's volume
 - Right-click the bar icon: switch back to this computer
 - Scroll-wheel on the icon: volume of the current output
+- Volume keys / the system audio panel: same level on the current Sonos room
 
 AirPlay to Sonos has about 1.5 seconds of latency. Fine for music; not
 great for games or video unless you can delay the picture to match.
@@ -83,7 +88,8 @@ AirPlay sink is ready.
    receiver. The widget matches sinks by the speaker's MAC (`Sonos-<MAC>`
    in the sink name) so a room like "Basement" is not confused with an
    Apple TV of the same name. Selecting a room calls
-   `omarchy-audio-output-set-default`.
+   `omarchy-audio-output-set-default` after setting the sink volume to
+   the speaker's current level.
 
 State lives in `~/.local/state/omarchy-sonos/`, not in the plugin
 directory, so saving it does not reload Omarchy shell.

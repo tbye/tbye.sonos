@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "tbye.sonos",
   "name": "Sonos",
-  "version": "1.0.0",
+  "version": "1.0.2",
   "author": "tbye",
   "homepage": "https://github.com/tbye/tbye.sonos",
   "license": "MIT",

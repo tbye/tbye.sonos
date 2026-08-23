@@ -38,6 +38,9 @@ Panel {
   property int selectedIndex: 0
   property bool cursorActive: false
   property string statusText: "Looking for speakers"
+  property bool suppressSystemSync: false
+  property double lastSystemPushMs: 0
+  property int lastSeenSonosVolume: -1
 
   readonly property var nodes: Pipewire.nodes ? Pipewire.nodes.values : []
   readonly property var sinkNodes: {
@@ -63,8 +66,17 @@ Panel {
   readonly property string heroMeta: loading && speakers.length === 0
     ? "SEARCHING"
     : (lastError && speakers.length === 0 ? "UNREACHABLE" : currentName.toUpperCase())
+  readonly property var defaultSink: Pipewire.defaultAudioSink
+  readonly property real systemVolume: defaultSink && defaultSink.audio ? defaultSink.audio.volume : 0
+  readonly property bool systemMuted: defaultSink && defaultSink.audio ? defaultSink.audio.muted : false
 
   PwObjectTracker { objects: root.sinkNodes }
+
+  Connections {
+    target: root.defaultSink && root.defaultSink.audio ? root.defaultSink.audio : null
+    function onVolumeChanged() { root.pushSystemToSpeaker() }
+    function onMutedChanged() { root.pushSystemToSpeaker() }
+  }
 
   function speakerByUid(uid) {
     for (var i = 0; i < speakers.length; i++)
@@ -127,6 +139,56 @@ Panel {
     return null
   }
 
+  function holdSystemSync() {
+    suppressSystemSync = true
+    suppressTimer.restart()
+  }
+
+  function matchSinkVolume(node, spk) {
+    if (!node || !node.audio) return
+    holdSystemSync()
+    var level = 0
+    if (spk)
+      level = Math.max(0, Math.min(1, Number(spk.volume || 0) / 100))
+    node.audio.volume = level
+    if (spk)
+      node.audio.muted = spk.muted === true
+  }
+
+  function defaultSinkIsCurrentSpeaker() {
+    if (!routingToSonos || !selectedSpeaker) return false
+    var sink = defaultSink
+    var node = sinkForSpeaker(selectedSpeaker)
+    if (!sink || !node) return false
+    return String(sink.name || "") === String(node.name || "")
+  }
+
+  function systemVolumePercent() {
+    if (!defaultSink || !defaultSink.audio) return -1
+    return Math.max(0, Math.min(100, Math.round(Number(defaultSink.audio.volume) * 100)))
+  }
+
+  function pushSystemToSpeaker() {
+    if (suppressSystemSync) return
+    if (!defaultSinkIsCurrentSpeaker()) return
+    if (draggingUid === outputId) return
+    var audio = defaultSink.audio
+    var spk = selectedSpeaker
+    if (!audio || !spk) return
+    var level = systemVolumePercent()
+    var muted = audio.muted === true
+    var volSame = Math.abs(Number(spk.volume || 0) - level) < 1
+    var muteSame = (spk.muted === true) === muted
+    if (volSame && muteSame) return
+    lastSystemPushMs = Date.now()
+    if (!volSame)
+      queueVolume(spk.uid, level, true)
+    if (!muteSame) {
+      patchSpeaker(spk.uid, { muted: muted })
+      Quickshell.execDetached(["python3", "-B", helper, "mute", spk.uid, muted ? "on" : "off"])
+    }
+  }
+
   function setDefaultSink(node) {
     if (!node) return false
     Pipewire.preferredDefaultAudioSink = node
@@ -162,12 +224,11 @@ Panel {
     var next = []
     for (var i = 0; i < parsed.speakers.length; i++) {
       var row = parsed.speakers[i]
-      if (draggingUid && row.uid === draggingUid) {
-        var keep = speakerByUid(draggingUid)
-        if (keep) {
-          row = Object.assign({}, row)
-          row.volume = keep.volume
-        }
+      var keep = speakerByUid(row.uid)
+      if (keep && (row.volumeReady === false || (draggingUid && row.uid === draggingUid))) {
+        row = Object.assign({}, row)
+        row.volume = keep.volume
+        row.muted = keep.muted
       }
       next.push(row)
     }
@@ -177,6 +238,7 @@ Panel {
       : (routingToSonos ? ("Playing on " + currentName) : "This computer")
     if (selectedIndex >= rowCount) selectedIndex = Math.max(0, rowCount - 1)
     if (pendingSelect) tryPendingSelect()
+    syncSpeakerToSystem()
   }
 
   function patchSpeaker(uid, fields) {
@@ -219,6 +281,7 @@ Panel {
     speakers = next
     var node = sinkForSpeaker(spk)
     if (node) {
+      matchSinkVolume(node, spk)
       setDefaultSink(node)
       pendingSelect = ""
     }
@@ -233,19 +296,51 @@ Panel {
     var spk = speakerByUid(pendingSelect)
     var node = sinkForSpeaker(spk)
     if (!node) return
+    matchSinkVolume(node, spk)
     setDefaultSink(node)
     pendingSelect = ""
     pendingTimer.stop()
     delayedRefresh.restart()
   }
 
-  function queueVolume(uid, level) {
+  function queueVolume(uid, level, fromSystem) {
     var value = Math.max(0, Math.min(100, Math.round(level)))
     var current = speakerByUid(uid)
     patchSpeaker(uid, { volume: value, muted: current ? current.muted : false })
+    if (uid === outputId)
+      lastSeenSonosVolume = value
+    if (uid === outputId && !fromSystem) {
+      var node = sinkForSpeaker(current)
+      if (node && node.audio) {
+        holdSystemSync()
+        node.audio.volume = value / 100
+        if (current) node.audio.muted = current.muted === true
+      }
+    }
     queuedUid = uid
     queuedVolume = value
     volumeFlush.restart()
+  }
+
+  function syncSpeakerToSystem() {
+    if (!routingToSonos || draggingUid === outputId || suppressSystemSync)
+      return
+    var spk = selectedSpeaker
+    if (!spk || spk.volumeReady === false) return
+    var sonos = Math.round(Number(spk.volume || 0))
+    if (lastSeenSonosVolume < 0) {
+      lastSeenSonosVolume = sonos
+      return
+    }
+    if (sonos === lastSeenSonosVolume) return
+    lastSeenSonosVolume = sonos
+    if (Date.now() - lastSystemPushMs < 1500) return
+    var node = sinkForSpeaker(spk)
+    if (!node || !node.audio) return
+    var sys = Math.round(Number(node.audio.volume) * 100)
+    var muteSame = (spk.muted === true) === (node.audio.muted === true)
+    if (Math.abs(sys - sonos) < 1 && muteSame) return
+    matchSinkVolume(node, spk)
   }
 
   function flushVolume() {
@@ -260,7 +355,15 @@ Panel {
   function toggleMute(uid) {
     var spk = speakerByUid(uid)
     if (!spk) return
-    patchSpeaker(uid, { muted: !spk.muted })
+    var muted = !spk.muted
+    patchSpeaker(uid, { muted: muted })
+    if (uid === outputId) {
+      var node = sinkForSpeaker(spk)
+      if (node && node.audio) {
+        holdSystemSync()
+        node.audio.muted = muted
+      }
+    }
     Quickshell.execDetached(["python3", "-B", helper, "mute", uid, "toggle"])
     delayedRefresh.restart()
   }
@@ -319,6 +422,10 @@ Panel {
       sink.audio.volume = Math.max(0, Math.min(1, sink.audio.volume + delta / 100))
   }
 
+  onOutputIdChanged: lastSeenSonosVolume = -1
+  onSystemVolumeChanged: pushSystemToSpeaker()
+  onSystemMutedChanged: pushSystemToSpeaker()
+
   onOpenedChanged: {
     if (opened) {
       cursorActive = false
@@ -350,11 +457,18 @@ Panel {
   }
 
   Timer {
-    interval: root.opened ? 4000 : 15000
+    interval: (root.opened || root.routingToSonos) ? 4000 : 15000
     running: true
     repeat: true
     triggeredOnStart: true
     onTriggered: root.refresh()
+  }
+
+  Timer {
+    id: suppressTimer
+    interval: 180
+    repeat: false
+    onTriggered: root.suppressSystemSync = false
   }
 
   Timer {
