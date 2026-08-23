@@ -1,4 +1,4 @@
-# omarchy-sonos
+# tbye.sonos
 
 Omarchy bar widget that sends this computer's audio to a Sonos speaker and
 controls volume on every speaker in the household.
@@ -32,11 +32,13 @@ and enables the widget next to the stock audio control.
 Or, on a machine that already has Omarchy:
 
 ```bash
-omarchy plugin add https://github.com/tbye/omarchy-sonos.git --enable --yes
+omarchy plugin add https://github.com/tbye/tbye.sonos.git --enable --yes
 omarchy bar move tbye.sonos --before omarchy.audio
 # still run the RAOP half of install.sh so speakers show up as audio sinks
 ./scripts/install.sh
 ```
+
+Remove with `omarchy plugin remove tbye.sonos`.
 
 If speakers appear in the list but play stays on the laptop, open UDP
 6001–6010 from your LAN (AirPlay timing/control):
@@ -88,5 +90,5 @@ directory, so saving it does not reload Omarchy shell.
 
 ## Issues, support and feedback welcome
 
-Please create an [issue](https://github.com/tbye/omarchy-sonos/issues/new)
+Please create an [issue](https://github.com/tbye/tbye.sonos/issues/new)
 if there's anything I can help you with.

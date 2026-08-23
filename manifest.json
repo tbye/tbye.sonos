@@ -4,6 +4,7 @@
   "name": "Sonos",
   "version": "1.0.0",
   "author": "tbye",
+  "homepage": "https://github.com/tbye/tbye.sonos",
   "license": "MIT",
   "description": "Route system audio to a Sonos speaker and control volume on the local household.",
   "kinds": [
