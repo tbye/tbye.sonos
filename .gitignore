@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+*.qmlc
+.qmlcache/
+state.json
+*.bak
+.DS_Store

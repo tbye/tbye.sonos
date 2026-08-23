@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "id": "tbye.sonos",
+  "name": "Sonos",
+  "version": "1.0.0",
+  "author": "tbye",
+  "license": "MIT",
+  "description": "Route system audio to a Sonos speaker and control volume on the local household.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Sonos",
+    "description": "Pick a Sonos speaker or this computer as the audio output, with per-speaker volume.",
+    "category": "Audio",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}
