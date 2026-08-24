@@ -175,5 +175,63 @@ class StateSanitizeTests(unittest.TestCase):
         self.assertEqual(state["output"], "local")
 
 
+class StateFileTests(unittest.TestCase):
+    def test_load_state_rejects_oversize_before_parse(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "state.json"
+            state_path.write_bytes(b"{" + b"x" * (sonosctl.MAX_STATE_BYTES + 8))
+            with mock.patch.object(sonosctl, "STATE_PATH", state_path):
+                self.assertEqual(sonosctl.load_state(), {})
+
+    def test_load_state_rejects_symlink(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "other.json"
+            target.write_text(json.dumps({"seedIps": ["192.168.0.4"]}), encoding="utf-8")
+            state_path = Path(tmp) / "state.json"
+            state_path.symlink_to(target)
+            with mock.patch.object(sonosctl, "STATE_PATH", state_path):
+                self.assertEqual(sonosctl.load_state(), {})
+
+    def test_load_state_rejects_fifo(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "state.json"
+            os.mkfifo(state_path)
+            with mock.patch.object(sonosctl, "STATE_PATH", state_path):
+                self.assertEqual(sonosctl.load_state(), {})
+
+    def test_save_state_does_not_follow_predictable_tmp_symlink(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state_dir = Path(tmp)
+            state_path = state_dir / "state.json"
+            victim = state_dir / "victim.txt"
+            victim.write_text("keep me", encoding="utf-8")
+            predictable = state_dir / "state.json.tmp"
+            predictable.symlink_to(victim)
+            with mock.patch.object(sonosctl, "STATE_DIR", state_dir), mock.patch.object(
+                sonosctl, "STATE_PATH", state_path
+            ):
+                sonosctl.save_state({"output": "local"})
+            self.assertEqual(victim.read_text(encoding="utf-8"), "keep me")
+            self.assertTrue(predictable.is_symlink())
+            self.assertTrue(state_path.is_file())
+            self.assertFalse(state_path.is_symlink())
+            self.assertEqual(json.loads(state_path.read_text(encoding="utf-8"))["output"], "local")
+
+    def test_save_state_replaces_state_path_symlink(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state_dir = Path(tmp)
+            victim = state_dir / "other.json"
+            victim.write_text('{"keep": true}\n', encoding="utf-8")
+            state_path = state_dir / "state.json"
+            state_path.symlink_to(victim)
+            with mock.patch.object(sonosctl, "STATE_DIR", state_dir), mock.patch.object(
+                sonosctl, "STATE_PATH", state_path
+            ):
+                sonosctl.save_state({"output": "local"})
+            self.assertFalse(state_path.is_symlink())
+            self.assertEqual(json.loads(victim.read_text(encoding="utf-8")), {"keep": True})
+            self.assertEqual(json.loads(state_path.read_text(encoding="utf-8"))["output"], "local")
+
+
 if __name__ == "__main__":
     unittest.main()

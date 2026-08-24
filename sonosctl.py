@@ -8,8 +8,10 @@ import json
 import os
 import re
 import select
+import stat
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.request
 import xml.etree.ElementTree as ET
@@ -26,11 +28,12 @@ SOAP_TIMEOUT = 1.6
 USER_AGENT = "omarchy-sonos/1.0"
 
 # LAN responders control Avahi and SOAP bodies. Bound every hop before the
-# helper prints JSON or the shell collects it.
+# helper prints JSON or the shell collects it. State is user-writable too.
 MAX_HTTP_BYTES = 256 * 1024
 MAX_AVAHI_BYTES = 64 * 1024
 MAX_PACTL_BYTES = 256 * 1024
 MAX_STDOUT_BYTES = 128 * 1024
+MAX_STATE_BYTES = 128 * 1024
 MAX_SEED_IPS = 16
 MAX_SPEAKERS = 32
 MAX_SINKS = 64
@@ -214,24 +217,56 @@ def sanitize_state(data: dict) -> dict:
     return data
 
 
+def read_regular_capped(path: Path, limit: int) -> bytes:
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    fd = os.open(path, flags)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_size > limit:
+            raise ValueError("file too large")
+        buf = bytearray()
+        while len(buf) <= limit:
+            chunk = os.read(fd, min(65536, limit + 1 - len(buf)))
+            if not chunk:
+                break
+            buf.extend(chunk)
+        if len(buf) > limit:
+            raise ValueError("file too large")
+        return bytes(buf)
+    finally:
+        os.close(fd)
+
+
 def load_state() -> dict:
     try:
-        text = STATE_PATH.read_text(encoding="utf-8")
-        if len(text) > MAX_STDOUT_BYTES:
-            return {}
-        data = json.loads(text)
+        raw = read_regular_capped(STATE_PATH, MAX_STATE_BYTES)
+    except (OSError, ValueError):
+        return {}
+    try:
+        data = json.loads(raw)
         if isinstance(data, dict):
             return sanitize_state(data)
-    except (OSError, json.JSONDecodeError):
+    except json.JSONDecodeError:
         pass
     return {}
 
 
 def save_state(state: dict) -> None:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
-    tmp = STATE_PATH.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
-    tmp.replace(STATE_PATH)
+    payload = json.dumps(state, indent=2) + "\n"
+    fd, tmp_name = tempfile.mkstemp(prefix="state.", suffix=".tmp", dir=STATE_DIR)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_name, STATE_PATH)
+    except Exception:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
 
 
 def http_post(url: str, body: bytes, headers: dict, timeout: float = SOAP_TIMEOUT) -> str:

@@ -114,7 +114,10 @@ from older installers. It does not remove `pipewire-zeroconf`.
    the speaker's current level.
 
 State lives in `~/.local/state/omarchy-sonos/`, not in the plugin
-directory, so saving it does not reload Omarchy shell.
+directory, so saving it does not reload Omarchy shell. The helper
+byte-caps that file, opens it without following a symlink, and writes
+through an exclusive temporary name so a planted entry cannot retain
+the shared shell or overwrite another path.
 
 ## Issues, support and feedback welcome
 
