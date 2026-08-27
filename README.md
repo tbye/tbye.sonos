@@ -123,3 +123,8 @@ the shared shell or overwrite another path.
 
 Please create an [issue](https://github.com/tbye/tbye.sonos/issues/new)
 if there's anything I can help you with.
+
+
+####
+
+tbye.sonos is in no way affiliated with Sonos.  Sonos and related marks are property of their owners.
